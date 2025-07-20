@@ -3,12 +3,14 @@ from pydantic import BaseModel
 from typing import Literal
 import firebase_admin
 from firebase_admin import credentials, firestore
-from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics import confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
 import pandas as pd
 import numpy as np
-import json
-
+from pathlib import Path
 
 # Inicializa Firebase
 cred = credentials.Certificate("serviceAccountKey.json")
@@ -17,7 +19,7 @@ db = firestore.client()
 
 app = FastAPI()
 
-# Modelos Pydantic para validação (equivalentes às suas interfaces TypeScript)
+# Modelos Pydantic para validação
 class CustomerData(BaseModel):
     name: str
     gender: Literal["male", "female"]
@@ -49,123 +51,191 @@ class Workout(BaseModel):
     weeklyFrequency: Literal["2x", "3x", "5x+"]
     subWorkouts: list[SubWorkout]
 
-# Endpoint para receber dados do usuário e retornar o treino recomendado
+# Variáveis globais para armazenar encoders e scaler
+encoders = {
+    'workoutType': LabelEncoder(),
+    'difficulty': LabelEncoder(),
+    'goal': LabelEncoder(),
+    'category': LabelEncoder(),
+    'weeklyFrequency': LabelEncoder()
+}
+scaler = StandardScaler()
+
+def load_and_preprocess_workouts():
+    """Carrega e pré-processa os treinos uma vez ao iniciar"""
+    workouts_ref = db.collection("workouts")
+    workouts = [doc.to_dict() for doc in workouts_ref.stream()]
+    
+    if not workouts:
+        raise ValueError("Nenhum treino encontrado no banco de dados")
+    
+    df = pd.DataFrame(workouts)
+    
+    # Verificar colunas obrigatórias
+    required_columns = ['workoutType', 'difficulty', 'goal', 'category', 'weeklyFrequency', 'id']
+    missing_cols = [col for col in required_columns if col not in df.columns]
+    if missing_cols:
+        raise ValueError(f"Colunas obrigatórias faltando: {missing_cols}")
+    
+    # Codificar variáveis categóricas
+    for col, encoder in encoders.items():
+        df[col] = encoder.fit_transform(df[col])
+    
+    # Selecionar features para o modelo
+    features = df[['workoutType', 'difficulty', 'goal', 'category', 'weeklyFrequency']]
+    
+    # Normalizar os dados
+    global scaler
+    scaled_features = scaler.fit_transform(features)
+    
+    return df, scaled_features
+
+# Carrega os dados ao iniciar a aplicação
+try:
+    workouts_df, workouts_features = load_and_preprocess_workouts()
+except Exception as e:
+    print(f"Erro ao carregar treinos: {str(e)}")
+    workouts_df, workouts_features = None, None
+
 @app.post("/recommend-workout")
 async def recommend_workout(customer_data: CustomerData):
     try:
-        # 1. Carregar dados de treinos do Firebase
-        workouts_ref = db.collection("workouts")
-        workouts = [doc.to_dict() for doc in workouts_ref.stream()]
+        if workouts_df is None:
+            raise HTTPException(status_code=503, detail="Serviço de recomendação não disponível")
         
-        # 2. Pré-processar dados para ML
-        df_workouts = pd.DataFrame(workouts)
-        df_workouts = preprocess_workouts(df_workouts)
-        
-        # 3. Pré-processar dados do cliente
-        client_features = preprocess_client(customer_data)
-        
-        # 4. Treinar/Usar modelo de recomendação
-        recommended_workout_id = get_recommendation(df_workouts, client_features)
-        
+        # Pré-processar dados do cliente
+        client_features = {
+            "workoutType": customer_data.gender,
+            "difficulty": time_to_difficulty(customer_data.trainingTime),
+            "goal": customer_data.goal,
+            "category": customer_data.muscleFocus,
+            "weeklyFrequency": customer_data.weeklyFrequency
+        }
 
-        return {"workout_id": recommended_workout_id }
+        # Aplicar restrições de negócio
+        if (client_features["weeklyFrequency"] == "2x" and 
+            client_features["difficulty"] != "beginner"):
+            # Se for intermediário/avançado pedindo 2x/semana, ajustamos para beginner
+            client_features["difficulty"] = "beginner"        
+        
+        # Codificar features do cliente
+        encoded_features = []
+        for col in ['workoutType', 'difficulty', 'goal', 'category', 'weeklyFrequency']:
+            encoded_features.append(encoders[col].transform([client_features[col]])[0])
+        
+        # Normalizar
+        client_vector = scaler.transform([encoded_features])
+        
+        # Encontrar treinos mais similares
+        knn = NearestNeighbors(n_neighbors=3, metric='cosine')
+        knn.fit(workouts_features)
+        distances, indices = knn.kneighbors(client_vector)
+        
+        # Pegar o mais similar (menor distância)
+        best_match_idx = indices[0][0]
+        recommended_workout = workouts_df.iloc[best_match_idx]
+        
+        return {
+            "workout_id": recommended_workout['id'],
+            "workout_name": recommended_workout['name'],
+            "confidence": 1 - distances[0][0]  # Converter distância para "confiança"
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro na recomendação: {str(e)}")
+
+def time_to_difficulty(training_time: str) -> str:
+    """Mapeia tempo de treino para nível de dificuldade"""
+    mapping = {
+        "0-2": "beginner",
+        "2-6": "beginner",
+        "6-12": "intermediate1",
+        "12-17": "intermediate1", 
+        "17+": "advanced"
+    }
+    return mapping.get(training_time, "beginner")
+
+@app.get("/evaluate-model")
+async def evaluate_model(sample_size: int = 20):
+    try:
+        if workouts_df is None:
+            raise HTTPException(status_code=503, detail="Dados não carregados")
+        
+        # Gerar dados de teste sintéticos baseados nos treinos existentes
+        test_cases = []
+        workout_ids = workouts_df['id'].unique()
+        
+        for _ in range(sample_size):
+            workout = workouts_df.sample(1).iloc[0]
+            test_cases.append({
+                "gender": encoders['workoutType'].inverse_transform([workout['workoutType']])[0],
+                "trainingTime": inverse_time_to_difficulty(workout['difficulty']),
+                "goal": encoders['goal'].inverse_transform([workout['goal']])[0],
+                "muscleFocus": encoders['category'].inverse_transform([workout['category']])[0],
+                "weeklyFrequency": encoders['weeklyFrequency'].inverse_transform([workout['weeklyFrequency']])[0],
+                "expected_workout_id": workout['id']
+            })
+        
+        # Avaliar recomendações
+        y_true = []
+        y_pred = []
+        
+        for case in test_cases:
+            try:
+                customer_data = CustomerData(
+                    name="Test User",
+                    gender=case["gender"],
+                    age=30,
+                    weight=70,
+                    goal=case["goal"],
+                    trainingTime=case["trainingTime"],
+                    weeklyFrequency=case["weeklyFrequency"],
+                    muscleFocus=case["muscleFocus"]
+                )
+                
+                response = await recommend_workout(customer_data)
+                y_true.append(case["expected_workout_id"])
+                y_pred.append(response["workout_id"])
+            except Exception as e:
+                print(f"Erro no caso de teste: {str(e)}")
+                continue
+        
+        # Gerar matriz de confusão
+        cm = confusion_matrix(y_true, y_pred, labels=workout_ids)
+        
+        # Salvar visualização
+        plt.figure(figsize=(12, 10))
+        sns.heatmap(cm, annot=True, fmt='d', xticklabels=workout_ids, yticklabels=workout_ids)
+        plt.title("Matriz de Confusão - Sistema de Recomendação")
+        plt.ylabel("Treino Esperado")
+        plt.xlabel("Treino Recomendado")
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        # Criar diretório se não existir
+        Path("results").mkdir(exist_ok=True)
+        plot_path = "results/confusion_matrix.png"
+        plt.savefig(plot_path)
+        plt.close()
+        
+        return {
+            "status": "success",
+            "plot_path": plot_path,
+            "accuracy": np.trace(cm) / np.sum(cm) if np.sum(cm) > 0 else 0
+        }
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# Funções auxiliares
-def preprocess_workouts(df: pd.DataFrame) -> pd.DataFrame:
-    """Pré-processa os dados dos treinos"""
-    required_columns = ['workoutType', 'difficulty', 'goal', 'category', 'weeklyFrequency', 'id']
-    missing_cols = [col for col in required_columns if col not in df.columns]
-    
-    if missing_cols:
-        raise ValueError(f"Colunas obrigatórias faltando: {missing_cols}")
-
-    encoders = {
-        'workoutType': LabelEncoder(),
-        'difficulty': LabelEncoder(),
-        'goal': LabelEncoder(),
-        'category': LabelEncoder(),
-        'weeklyFrequency': LabelEncoder()
+def inverse_time_to_difficulty(difficulty_encoded: int) -> str:
+    """Mapeia dificuldade codificada para tempo de treino aproximado"""
+    difficulty = encoders['difficulty'].inverse_transform([difficulty_encoded])[0]
+    mapping = {
+        "beginner": "2-6",
+        "intermediate1": "6-12",
+        "advanced": "17+"
     }
-
-    for col, encoder in encoders.items():
-        df[col] = encoder.fit_transform(df[col])
-
-    return df
-
-def preprocess_client(client_data: CustomerData) -> dict:
-    """Pré-processa os dados do cliente"""
-    time_to_difficulty = {
-        "0-2": 0, "2-6": 0, "6-12": 1, 
-        "12-17": 1, "17+": 2  # 0=beginner, 1=intermediate1, 2=advanced
-    }
-    
-    weekly_freq_mapping = {"2x": 0, "3x": 1, "5x+": 2}
-    
-    return {
-        "gender": 0 if client_data.gender == "male" else 1,
-        "age": client_data.age,
-        "weight": client_data.weight,
-        "goal": 0 if client_data.goal == "hypertrophy" else 1,
-        "trainingTime": time_to_difficulty[client_data.trainingTime],
-        "weeklyFrequency": weekly_freq_mapping[client_data.weeklyFrequency],
-        "muscleFocus": client_data.muscleFocus.lower()
-    }
-
-def get_recommendation(workouts_df: pd.DataFrame, client_features: dict) -> str:
-    """Lógica de recomendação com prioridade para weeklyFrequency"""
-    try:
-        # 1. Filtrar por frequência semanal primeiro
-        freq_mask = workouts_df['weeklyFrequency'] == client_features['weeklyFrequency']
-        matching_workouts = workouts_df[freq_mask]
-        
-        # Fallback: pegar a frequência mais próxima se não encontrar
-        if len(matching_workouts) == 0:
-            freq_diff = np.abs(workouts_df['weeklyFrequency'] - client_features['weeklyFrequency'])
-            closest_idx = freq_diff.idxmin()
-            matching_workouts = workouts_df.loc[[closest_idx]]
-
-        # 2. Codificar features apenas com os treinos filtrados
-        muscle_encoder = LabelEncoder()
-        categories = list(matching_workouts['category'].unique()) + [client_features['muscleFocus']]
-        muscle_encoder.fit(categories)
-
-        difficulty_encoder = LabelEncoder()
-        difficulties = list(matching_workouts['difficulty'].unique()) + [client_features['trainingTime']]
-        difficulty_encoder.fit(difficulties)
-
-        # 3. Preparar dados codificados
-        matching_workouts = matching_workouts.copy()
-        matching_workouts['category_encoded'] = muscle_encoder.transform(matching_workouts['category'])
-        matching_workouts['difficulty_encoded'] = difficulty_encoder.transform(matching_workouts['difficulty'])
-
-        client_vector = np.array([
-            client_features['gender'],
-            difficulty_encoder.transform([client_features['trainingTime']])[0],
-            client_features['goal'],
-            muscle_encoder.transform([client_features['muscleFocus']])[0],
-            client_features['weeklyFrequency']
-        ]).reshape(1, -1)
-
-        workout_features = matching_workouts[[
-            'workoutType',
-            'difficulty_encoded',
-            'goal',
-            'category_encoded',
-            'weeklyFrequency'
-        ]].values
-
-        # 4. Encontrar treino mais similar
-        knn = NearestNeighbors(n_neighbors=1, metric='cosine')
-        knn.fit(workout_features)
-        distances, indices = knn.kneighbors(client_vector)
-
-        return matching_workouts.iloc[indices[0][0]]['id']
-
-    except Exception as e:
-        raise ValueError(f"Erro na recomendação: {str(e)}")
+    return mapping.get(difficulty, "2-6")
 
 if __name__ == "__main__":
     import uvicorn
